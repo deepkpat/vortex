@@ -1,17 +1,40 @@
-// Command vortex is a self-contained demonstration of a sharded, lock-free
-// event-processing pipeline, built twice: once the way most teams write it
-// first ("naive"), and once tuned with the techniques principal engineers
-// reach for when that naive version shows up hot in a profiler ("optimal").
+// Command vortex is a self-contained demonstration of an event-processing
+// pipeline built four times, showing the incremental gain from each technique:
+//
+//	[1] Naive     — mutex queue + channel semaphore (4× in-flight budget) +
+//	                binary.Write (reflects on every record). The intentionally
+//	                weak baseline from the original blog post.
+//
+//	[2] Idiomatic — buffered channel + worker pool. Raises the in-flight budget
+//	                to match the optimal engine (1024 per shard) and removes
+//	                reflection from writes. This is the fair Go baseline: once
+//	                the playing field is level the naive→idiomatic gap alone
+//	                accounts for ~half the total speedup.
+//
+//	[3] ShardedChan — per-shard buffered channels of event batches + mmap
+//	                persistence + channel-based work stealing (non-blocking
+//	                select across peer channels). Pure Go: no unsafe, no custom
+//	                data structures. Surprisingly competitive because Go's
+//	                scheduler is optimised for channel blocking; workers park
+//	                instead of spinning when their shard is idle.
+//
+//	[4] Optimal   — sharded SPSC ring buffers + Chase-Lev work-stealing deques
+//	                + padded atomic semaphores + mmap. Wins when the workload
+//	                is CPU-bound and sustained: it avoids scheduler round-trips
+//	                entirely, but the spin-wait idle path costs more than
+//	                channel parking under bursty or uneven load.
 //
 // Concepts covered, and where:
 //
-//  1. False-sharing padding  -> cacheLineSize / pad fields, demoFalseSharing()
-//  2. Atomic semaphore       -> PaddedSemaphore  (vs ChanSemaphore)
-//  3. Sharding               -> OptimalEngine: N independent shards, each
-//     with its own ring buffer + deque + semaphore
-//  4. SPSC ring buffer       -> SPSCRingBuffer  (vs mutex-guarded NaiveQueue)
-//  5. Work-stealing queues   -> WSDeque (Chase-Lev bounded deque)
-//  6. mmap + unsafe          -> MMapStore (vs NaiveStore's buffered file I/O)
+//  1. Cache-line padding      -> cacheLineSize / pad fields, demoFalseSharing()
+//  2. Semaphore variants      -> ChanSemaphore (channel) vs PaddedSemaphore
+//     (atomic CAS loop, false-share-free)
+//  3. Sharding                -> engines 3 & 4: N independent shards,
+//     hash-routed by ShardKey
+//  4. SPSC ring buffer        -> SPSCRingBuffer (engine 4 only)
+//  5. Work-stealing           -> WSDeque / Chase-Lev (engine 4);
+//     non-blocking select across channels (engine 3)
+//  6. mmap + unsafe           -> MMapStore (engines 3 & 4) vs NaiveStore
 //
 // Run it:  go run main.go
 package main
@@ -393,6 +416,20 @@ func (s *NaiveStore) Write(rec ResultRecord) {
 	s.mu.Unlock()
 }
 
+// writeRecord avoids binary.Write's per-call reflection by writing each field
+// directly. Used by IdiomaticEngine to give it a fair comparison.
+func (s *NaiveStore) writeRecord(rec ResultRecord) {
+	var buf [32]byte
+	binary.LittleEndian.PutUint64(buf[0:], rec.ID)
+	binary.LittleEndian.PutUint64(buf[8:], uint64(rec.Timestamp))
+	binary.LittleEndian.PutUint64(buf[16:], rec.Checksum)
+	binary.LittleEndian.PutUint32(buf[24:], uint32(rec.Worker))
+	// buf[28:32] stays zero — matches the explicit pad in ResultRecord
+	s.mu.Lock()
+	_, _ = s.w.Write(buf[:])
+	s.mu.Unlock()
+}
+
 func (s *NaiveStore) Close() error {
 	if err := s.w.Flush(); err != nil {
 		return err
@@ -450,7 +487,213 @@ func (m *MMapStore) Close() error {
 }
 
 // ---------------------------------------------------------------------------
-// Engines: Naive vs Optimal
+// Engines: four implementations of the same pipeline
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Engine 2: Idiomatic Go — buffered channel + worker pool
+//
+// This is the "fair" baseline the commenter asked for: the channel's own
+// capacity bounds in-flight work (same 1024*numShards budget as Optimal),
+// binary.Write is replaced by a plain typed write, and every worker draws
+// from the same channel so there's no semaphore at all.
+// ---------------------------------------------------------------------------
+
+type IdiomaticEngine struct {
+	ch        chan *Event
+	store     *NaiveStore
+	wg        sync.WaitGroup
+	processed atomic.Int64
+}
+
+func runIdiomatic(events []*Event, numWorkers int, path string) (time.Duration, int64) {
+	store, err := NewNaiveStore(path)
+	if err != nil {
+		panic(err)
+	}
+	// Match the total in-flight budget of OptimalEngine (1024 per shard).
+	inFlight := numWorkers * 1024
+	eng := &IdiomaticEngine{
+		ch:    make(chan *Event, inFlight),
+		store: store,
+	}
+
+	start := time.Now()
+
+	eng.wg.Add(numWorkers)
+	for i := 0; i < numWorkers; i++ {
+		go eng.worker(i)
+	}
+
+	go func() {
+		for _, ev := range events {
+			eng.ch <- ev // blocks naturally when the channel is full
+		}
+		close(eng.ch)
+	}()
+
+	eng.wg.Wait()
+	dur := time.Since(start)
+
+	if err := eng.store.Close(); err != nil {
+		panic(err)
+	}
+	return dur, eng.processed.Load()
+}
+
+func (eng *IdiomaticEngine) worker(id int) {
+	defer eng.wg.Done()
+	for ev := range eng.ch {
+		checksum := computeChecksum(ev)
+		rec := ResultRecord{
+			ID:        ev.ID,
+			Timestamp: time.Now().UnixNano(),
+			Checksum:  checksum,
+			Worker:    int32(id),
+		}
+		eng.store.writeRecord(rec)
+		eng.processed.Add(1)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Engine 3: Sharded channels + channel-based work stealing
+//
+// Each shard gets its own buffered channel of *batches*. A shard's owner
+// goroutine first drains its own channel; when idle it tries the others with
+// a non-blocking select — no custom deque, no unsafe, pure Go.
+// ---------------------------------------------------------------------------
+
+const chanBatchSize = 32
+
+type ShardedChanEngine struct {
+	numShards int
+	shards    []chan []*Event // each shard receives batches
+	store     *MMapStore
+
+	wg        sync.WaitGroup
+	processed atomic.Int64
+	steals    atomic.Int64
+}
+
+func runShardedChan(events []*Event, numShards int, path string) (time.Duration, int64, int64) {
+	store, err := NewMMapStore(path, len(events))
+	if err != nil {
+		panic(err)
+	}
+
+	eng := &ShardedChanEngine{
+		numShards: numShards,
+		shards:    make([]chan []*Event, numShards),
+		store:     store,
+	}
+	// 1024-event in-flight budget per shard, expressed as batch-count capacity.
+	chanCap := 1024 / chanBatchSize
+	if chanCap < 4 {
+		chanCap = 4
+	}
+	for i := range eng.shards {
+		eng.shards[i] = make(chan []*Event, chanCap)
+	}
+
+	start := time.Now()
+
+	eng.wg.Add(numShards)
+	for i := 0; i < numShards; i++ {
+		go eng.workerLoop(i)
+	}
+
+	go func() {
+		batch := make([]*Event, 0, chanBatchSize)
+		buckets := make([][]*Event, numShards)
+		for i := range buckets {
+			buckets[i] = make([]*Event, 0, chanBatchSize)
+		}
+		flush := func(s int) {
+			if len(buckets[s]) == 0 {
+				return
+			}
+			cp := make([]*Event, len(buckets[s]))
+			copy(cp, buckets[s])
+			eng.shards[s] <- cp
+			buckets[s] = buckets[s][:0]
+		}
+		_ = batch
+		for _, ev := range events {
+			s := int(hashKey(ev.ShardKey) % uint64(numShards))
+			buckets[s] = append(buckets[s], ev)
+			if len(buckets[s]) >= chanBatchSize {
+				flush(s)
+			}
+		}
+		for s := range buckets {
+			flush(s)
+		}
+		for i := range eng.shards {
+			close(eng.shards[i])
+		}
+	}()
+
+	eng.wg.Wait()
+	dur := time.Since(start)
+
+	if err := eng.store.Close(); err != nil {
+		panic(err)
+	}
+	return dur, eng.processed.Load(), eng.steals.Load()
+}
+
+func (eng *ShardedChanEngine) workerLoop(id int) {
+	defer eng.wg.Done()
+	mine := eng.shards[id]
+
+	for {
+		// Try own channel first (blocking).
+		batch, ok := <-mine
+		if ok {
+			eng.processBatch(batch, id)
+			continue
+		}
+
+		// Own channel closed — try to steal from others with a non-blocking select.
+		// We build a reflect-free select by iterating manually.
+		stole := false
+		for i := 0; i < eng.numShards; i++ {
+			if i == id {
+				continue
+			}
+			select {
+			case batch, ok = <-eng.shards[i]:
+				if ok {
+					eng.steals.Add(1)
+					eng.processBatch(batch, id)
+					stole = true
+				}
+			default:
+			}
+			if stole {
+				break
+			}
+		}
+		if !stole {
+			return
+		}
+	}
+}
+
+func (eng *ShardedChanEngine) processBatch(batch []*Event, workerID int) {
+	for _, ev := range batch {
+		checksum := computeChecksum(ev)
+		eng.store.Write(ResultRecord{
+			ID:        ev.ID,
+			Timestamp: time.Now().UnixNano(),
+			Checksum:  checksum,
+			Worker:    int32(workerID),
+		})
+		eng.processed.Add(1)
+	}
+}
+
 // ---------------------------------------------------------------------------
 
 type NaiveEngine struct {
@@ -673,27 +916,52 @@ func main() {
 
 	naivePath := filepathTemp("vortex-naive-*.dat")
 	defer os.Remove(naivePath)
-	fmt.Println("=== Naive pipeline: mutex queue + channel semaphore + buffered file I/O ===")
+	fmt.Println("=== [1/4] Naive: mutex queue + channel semaphore (4×workers in-flight) + binary.Write ===")
 	naiveDur, naiveProcessed := runNaive(events, numShards, naivePath)
 	fmt.Printf("processed=%d/%d duration=%v throughput=%.0f events/sec\n\n",
 		naiveProcessed, numEvents, naiveDur, float64(naiveProcessed)/naiveDur.Seconds())
 
+	idiomPath := filepathTemp("vortex-idiomatic-*.dat")
+	defer os.Remove(idiomPath)
+	fmt.Println("=== [2/4] Idiomatic Go: buffered channel (1024×workers in-flight) + typed write ===")
+	idiomDur, idiomProcessed := runIdiomatic(events, numShards, idiomPath)
+	fmt.Printf("processed=%d/%d duration=%v throughput=%.0f events/sec (%.2fx naive)\n\n",
+		idiomProcessed, numEvents, idiomDur, float64(idiomProcessed)/idiomDur.Seconds(),
+		naiveDur.Seconds()/idiomDur.Seconds())
+
+	chanPath := filepathTemp("vortex-shardedchan-*.dat")
+	defer os.Remove(chanPath)
+	fmt.Println("=== [3/4] Sharded channels + channel stealing + mmap ===")
+	chanDur, chanProcessed, chanSteals := runShardedChan(events, numShards, chanPath)
+	fmt.Printf("processed=%d/%d duration=%v throughput=%.0f events/sec steals=%d (%.2fx naive)\n\n",
+		chanProcessed, numEvents, chanDur, float64(chanProcessed)/chanDur.Seconds(), chanSteals,
+		naiveDur.Seconds()/chanDur.Seconds())
+
 	optPath := filepathTemp("vortex-mmap-*.dat")
 	defer os.Remove(optPath)
-	fmt.Println("=== Optimal pipeline: sharded SPSC rings + work-stealing deques + padded atomic semaphores + mmap ===")
+	fmt.Println("=== [4/4] Optimal: sharded SPSC rings + Chase-Lev deques + padded atomics + mmap ===")
 	optDur, optProcessed, steals := runOptimal(events, numShards, optPath)
-	fmt.Printf("processed=%d/%d duration=%v throughput=%.0f events/sec steals=%d\n\n",
-		optProcessed, numEvents, optDur, float64(optProcessed)/optDur.Seconds(), steals)
+	fmt.Printf("processed=%d/%d duration=%v throughput=%.0f events/sec steals=%d (%.2fx naive)\n\n",
+		optProcessed, numEvents, optDur, float64(optProcessed)/optDur.Seconds(), steals,
+		naiveDur.Seconds()/optDur.Seconds())
 
-	fmt.Printf("end-to-end speedup: %.2fx\n", naiveDur.Seconds()/optDur.Seconds())
+	fmt.Println("=== Progression summary ===")
+	fmt.Printf("%-40s  %8s  %8s\n", "Engine", "Throughput", "vs naive")
+	printRow := func(name string, dur time.Duration, n int64) {
+		tput := float64(n) / dur.Seconds()
+		fmt.Printf("%-40s  %8.0f  %7.2fx\n", name, tput, naiveDur.Seconds()/dur.Seconds())
+	}
+	printRow("Naive (unfair: 4x in-flight, reflection)", naiveDur, naiveProcessed)
+	printRow("Idiomatic (fair baseline)", idiomDur, idiomProcessed)
+	printRow("Sharded channels + stealing + mmap", chanDur, chanProcessed)
+	printRow("Optimal (SPSC+Chase-Lev+padded atomics)", optDur, optProcessed)
+
 	if runtime.NumCPU() < 4 {
-		fmt.Println("(run on a machine with more cores for a representative gap - a single-core")
-		fmt.Println(" sandbox understates the win, since nothing here can truly run in parallel.)")
+		fmt.Println("\n(run on ≥4 cores for representative numbers)")
 	}
 }
 
 func filepathTemp(pattern string) string {
-	// Modern file opening leveraging os.OpenRoot for temp directory access
 	tempDir := os.TempDir()
 	root, err := os.OpenRoot(tempDir)
 	if err != nil {
@@ -712,17 +980,56 @@ func filepathTemp(pattern string) string {
 
 /*
 === False sharing: two goroutines each hammering their own counter ===
-unpadded (both counters on one cache line): 629.217768ms
-padded   (each counter on its own line):    202.596917ms
+unpadded (both counters on one cache line): 628.92475ms
+padded   (each counter on its own line):    202.13496ms
 padding speedup: 3.11x
 
 generating 4000000 synthetic events across up to 997 shard keys, 8 shards, GOMAXPROCS=8
 
-=== Naive pipeline: mutex queue + channel semaphore + buffered file I/O ===
-processed=4000000/4000000 duration=5.680929314s throughput=704110 events/sec
+=== [1/4] Naive: mutex queue + channel semaphore (4×workers in-flight) + binary.Write ===
+processed=4000000/4000000 duration=5.365157908s throughput=745551 events/sec
 
-=== Optimal pipeline: sharded SPSC rings + work-stealing deques + padded atomic semaphores + mmap ===
-processed=4000000/4000000 duration=1.259856958s throughput=3174964 events/sec steals=206314
+=== [2/4] Idiomatic Go: buffered channel (1024×workers in-flight) + typed write ===
+processed=4000000/4000000 duration=1.901846037s throughput=2103220 events/sec (2.82x naive)
 
-end-to-end speedup: 4.51x
+=== [3/4] Sharded channels + channel stealing + mmap ===
+processed=4000000/4000000 duration=1.308540475s throughput=3056841 events/sec steals=55 (4.10x naive)
+
+=== [4/4] Optimal: sharded SPSC rings + Chase-Lev deques + padded atomics + mmap ===
+processed=4000000/4000000 duration=1.296157658s throughput=3086044 events/sec steals=191435 (4.14x naive)
+
+=== Progression summary ===
+Engine                                    Throughput  vs naive
+Naive (unfair: 4x in-flight, reflection)    745551     1.00x
+Idiomatic (fair baseline)                  2103220     2.82x
+Sharded channels + stealing + mmap         3056841     4.10x
+Optimal (SPSC+Chase-Lev+padded atomics)    3086044     4.14x
+*/
+
+/*
+=== False sharing: two goroutines each hammering their own counter ===
+unpadded (both counters on one cache line): 647.470792ms
+padded   (each counter on its own line):    195.27674ms
+padding speedup: 3.32x
+
+generating 4000000 synthetic events across up to 997 shard keys, 8 shards, GOMAXPROCS=8
+
+=== [1/4] Naive: mutex queue + channel semaphore (4×workers in-flight) + binary.Write ===
+processed=4000000/4000000 duration=5.622864009s throughput=711381 events/sec
+
+=== [2/4] Idiomatic Go: buffered channel (1024×workers in-flight) + typed write ===
+processed=4000000/4000000 duration=1.702621586s throughput=2349318 events/sec (3.30x naive)
+
+=== [3/4] Sharded channels + channel stealing + mmap ===
+processed=4000000/4000000 duration=1.262510823s throughput=3168290 events/sec steals=37 (4.45x naive)
+
+=== [4/4] Optimal: sharded SPSC rings + Chase-Lev deques + padded atomics + mmap ===
+processed=4000000/4000000 duration=1.378724359s throughput=2901233 events/sec steals=222795 (4.08x naive)
+
+=== Progression summary ===
+Engine                                    Throughput  vs naive
+Naive (unfair: 4x in-flight, reflection)    711381     1.00x
+Idiomatic (fair baseline)                  2349318     3.30x
+Sharded channels + stealing + mmap         3168290     4.45x
+Optimal (SPSC+Chase-Lev+padded atomics)    2901233     4.08x
 */
